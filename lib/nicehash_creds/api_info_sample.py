@@ -1,0 +1,6 @@
+org_id = 'organization_id_here'
+api_key = 'api_key_here'
+api_secret = 'api_secret_here'
+api_url_base = 'https://api2.nicehash.com'
+api_rig_path = '/main/api/v2/mining/rigs2'
+api_exchange_path = '/exchange/api/v2/info/prices'
