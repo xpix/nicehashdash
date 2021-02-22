@@ -19,33 +19,30 @@ import requests
 import sched
 from time import mktime, sleep
 from datetime import datetime
-import string
+from dateutil import tz
+#import string
 import uuid
 import hmac
 import json
 from hashlib import sha256
-from datetime import datetime
-from dateutil import tz
+
 LOG_FILE = "/var/log/nhpy.log"
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 
-logging.basicConfig(filename=LOG_FILE,format=LOG_FORMAT,level=logging.DEBUG)
+#logging.basicConfig(filename=LOG_FILE,format=LOG_FORMAT,level=logging.DEBUG)
+logging.basicConfig(level=logging.DEBUG)
 
 #base variables    
 from_zone = tz.gettz('UTC')
 to_zone = tz.gettz('America/Denver')
-
-
 query=''
-
 
 def get_epoch_ms_from_now():
     now = datetime.now()
     now_ec_since_epoch = mktime(now.timetuple()) + now.microsecond / 1000000.0
     return int(now_ec_since_epoch * 1000)
 
-
-def construct_request(): 
+def construct_request(endpoint): 
     xtime = get_epoch_ms_from_now()
     xnonce = str(uuid.uuid4())
 
@@ -62,12 +59,11 @@ def construct_request():
     priv_params += bytearray('\x00', 'utf-8')
     priv_params += bytearray('GET', 'utf-8')
     priv_params += bytearray('\x00', 'utf-8')
-    priv_params += bytearray(api_info.api_rig_path, 'utf-8')
+    priv_params += bytearray(endpoint, 'utf-8')
     priv_params += bytearray('\x00', 'utf-8')
     priv_params += bytearray(query, 'utf-8')
         
     xauth = hmac.new(bytearray(api_info.api_secret,'utf-8'), priv_params, sha256).hexdigest()
-
         
     headers = { 'Content-Type': 'application/json',
                 'Authorization': 'Bearer {0}'.format(api_info.api_key),
@@ -79,8 +75,7 @@ def construct_request():
     return headers
 
 def get_nh_stats():
-    response = requests.get(api_info.api_url_base + api_info.api_rig_path, headers=construct_request())
-    print(response.status_code)
+    response = requests.get(api_info.api_url_base + api_info.api_rig_path, headers=construct_request(api_info.api_rig_path))
     if response.status_code == 200:
         return json.loads(response.content.decode('utf-8'))
     else:        
@@ -92,13 +87,22 @@ def get_nh_stats():
     
 def return_nh_stats():
     nh_stats = get_nh_stats()
-    prices = requests.get(api_info.api_url_base + api_info.api_exchange_path, headers=construct_request())
+    balance = requests.get(api_info.api_url_base + api_info.api_accounting_path, headers=construct_request(api_info.api_accounting_path))
+    if balance.status_code == 200:
+        balance = json.loads(balance.content.decode('utf-8'))
+        balance_btc = round(float(balance['totalBalance']),5)
+    else:
+        balance_btc = 0
+        
+    prices = requests.get(api_info.api_url_base + api_info.api_exchange_path, headers=construct_request(api_info.api_exchange_path))
+
     if prices.status_code == 200:
         prices_all = json.loads(prices.content.decode('utf-8'))
         btc_price = prices_all['BTCUSDC']
     else:
         btc_price = 50000.00
 
+    balance_usd = float(balance_btc) * btc_price
     profit_btc = nh_stats['totalProfitability']
     profit_usd = profit_btc * btc_price;
 
@@ -114,6 +118,7 @@ def return_nh_stats():
     rt_profit = "$" + str(round(profit_usd,2))
     
     if 'MINING' not in nh_stats['minerStatuses']:
+        logging.info("No Miner Data")
         show_error('no data')
         
     num_mining = nh_stats['minerStatuses']['MINING']
@@ -125,54 +130,46 @@ def return_nh_stats():
                    "activew": str(num_mining),
                    "actived": str(num_devices),
                    "unpaid": "$" + str(round(unpaid_usd,2)),
-                   "nextpay": next_pay_in}
+                   "nextpay": next_pay_in,
+                   "balancebtc": str(balance_btc) +" BTC",
+                   "balanceusd": "$" + str(round(balance_usd))}
     return stats_array
     
-    
-
 def fetch_nh(sc): 
-    print("Fetching NH stuff...")
-    # do  stuff
     statsNow = return_nh_stats()
     updatedTime = datetime.now().strftime("%l:%M:%P")
-    print(statsNow["rtprofit"])
-    print(statsNow["btcprice"])
-    print("Active Workers: " + statsNow["activew"])
-    print("Unpaid: " + statsNow["unpaid"])
-    print("Payout in: "+ statsNow["nextpay"])
-    print("Updated : " + updatedTime)
-    perpetual_check.enter(300, 1, fetch_nh, (sc,))
+    #uncomment below to see console output 
+    #print(statsNow["rtprofit"])
+    #print(statsNow["btcprice"])
+    #print("Active Workers: " + statsNow["activew"])
+    #print("Unpaid: " + statsNow["unpaid"])
+    #print("Payout in: "+ statsNow["nextpay"])
+    #print("Updated : " + updatedTime)
+    perpetual_check.enter(120, 1, fetch_nh, (sc,))
     try:
-        #logging.info("epd2in13_V2 Demo")
-        epd = epd2in13_V2.EPD()
-        logging.info("init and Clear")
-        epd.init(epd.FULL_UPDATE)
-        epd.Clear(0xFF)
+        epd.init(epd.PART_UPDATE)
+        # set fonts
+        font15 = ImageFont.truetype(os.path.join(picdir, 'Roboto-Thin.ttf'), 15)
+        font17 = ImageFont.truetype(os.path.join(picdir, 'Roboto-Thin.ttf'), 17)
+        font24 = ImageFont.truetype(os.path.join(picdir, 'Roboto-Regular.ttf'), 24)
+        font24B = ImageFont.truetype(os.path.join(picdir, 'Roboto-Bold.ttf'), 24)
 
-        # Drawing on the image
-        font15 = ImageFont.truetype(os.path.join(picdir, 'Font.ttc'), 15)
-        font17 = ImageFont.truetype(os.path.join(picdir, 'Font.ttc'), 17)
-        font24 = ImageFont.truetype(os.path.join(picdir, 'Font.ttc'), 24)
-        
-        logging.info("1.Drawing image...")
         image = Image.new('1', (epd.height, epd.width), 255)  # 255: clear the frame    
         draw = ImageDraw.Draw(image)
         
         draw.rectangle([(0,0),(165,81)],fill = 0)
         draw.rectangle([(0,84),(255,122)],fill = 0)
         draw.line([(164,0),(164,122)], fill = 0,width = 2)
-        #draw.rectangle([(0,83),(180,84)],fill = 1)
-        #draw.line([(0,83),(180,83)], fill = 1,width = 2)
-        draw.text((8, 10), statsNow["rtprofit"], font = font24, fill = 1)
-        draw.text((8, 40), statsNow["btcprice"], font = font24, fill = 1)
-        draw.text((8, 90), statsNow["unpaid"], font = font24, fill = 1)
-        draw.text((172, 10), "updated at", font = font15, fill = 0)
-        draw.text((172, 25), updatedTime, font = font15, fill = 0)
-        draw.text((172, 40), statsNow["activew"] + " workers", font = font15, fill = 0)
-        draw.text((172, 55), statsNow["actived"] + " devices", font = font15, fill = 0)
-        draw.text((78, 93), "paying out in:" + statsNow["nextpay"], font = font17, fill = 1)
+        draw.text((8, 10), statsNow["rtprofit"], font = font24B, fill = 1)
+        draw.text((8, 43), statsNow["btcprice"], font = font24B, fill = 1)
+        draw.text((8, 90), statsNow["balancebtc"] + " / " + statsNow["balanceusd"], font = font24, fill = 1)
+        draw.text((172, 8), "@" + updatedTime, font = font15, fill = 0)
+        draw.text((172, 26), "actv: " + statsNow["activew"] + " / " + statsNow["actived"], font = font15, fill = 0)
+        draw.text((172, 44), "pnd: " + statsNow["unpaid"], font = font15, fill = 0)
+        draw.text((172, 62), "in" + statsNow["nextpay"], font = font15, fill = 0)
+        #draw.text((78, 93), "paying out in:" + statsNow["nextpay"], font = font17, fill = 1)
         image = image.transpose(Image.ROTATE_180)
-        epd.display(epd.getbuffer(image))
+        epd.displayPartial(epd.getbuffer(image))
         
     except IOError as e:
         logging.info(e)
@@ -185,15 +182,19 @@ def fetch_nh(sc):
 def show_error(status):
     logging.info("SHOW ERROR")
     epd = epd2in13_V2.EPD()
+    epd.init(epd.PART_UPDATE)
+    epd.Clear(0xFF)
     draw.rectangle([(0,84),(255,122)],fill = 0)
     draw.text((8, 90), str(status) + " Error from API", font = font24, fill = 1)
     image = image.transpose(Image.ROTATE_180)
-    epd.display(epd.getbuffer(image))
-    
+    epd.displayPartial(epd.getbuffer(image))
+    return 
+
+epd = epd2in13_V2.EPD()
+epd.init(epd.FULL_UPDATE)
+epd.Clear(0xFF)
 perpetual_check = sched.scheduler(time.time, time.sleep)
-perpetual_check.enter(1, 1, fetch_nh, (perpetual_check,))
+perpetual_check.enter(0, 1, fetch_nh, (perpetual_check,))
 perpetual_check.run()
 
 #END NICEHASH
-
-
