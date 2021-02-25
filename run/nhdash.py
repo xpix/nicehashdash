@@ -29,8 +29,8 @@ from hashlib import sha256
 LOG_FILE = "/var/log/nhpy.log"
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 
-#logging.basicConfig(filename=LOG_FILE,format=LOG_FORMAT,level=logging.DEBUG)
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(filename=LOG_FILE,format=LOG_FORMAT,level=logging.DEBUG)
+#logging.basicConfig(level=logging.DEBUG)
 
 #base variables    
 from_zone = tz.gettz('UTC')
@@ -75,51 +75,58 @@ def construct_request(endpoint):
     return headers
 
 def get_nh_stats():
-    response = requests.get(api_info.api_url_base + api_info.api_rig_path, headers=construct_request(api_info.api_rig_path))
-    if response.status_code == 200:
-        return json.loads(response.content.decode('utf-8'))
-    else:        
-        logging.info("Error response: " + str(response.status_code))
-        show_error(response.status_code)
-        time.sleep(30)
-        perpetual_check.enter(300, 1, fetch_nh, (sc,))
-        return None
+    fail = True;
+    while fail:
+        response = requests.get(api_info.api_url_base + api_info.api_rig_path, headers=construct_request(api_info.api_rig_path))
+        if response.status_code == 200:
+            fail = False
+            return json.loads(response.content.decode('utf-8'))
+        else:        
+            logging.info("Error response: " + str(response.status_code))
+            show_error(response.status_code)
+            time.sleep(30)
     
 def return_nh_stats():
-    nh_stats = get_nh_stats()
-    balance = requests.get(api_info.api_url_base + api_info.api_accounting_path, headers=construct_request(api_info.api_accounting_path))
-    if balance.status_code == 200:
-        balance = json.loads(balance.content.decode('utf-8'))
-        balance_btc = round(float(balance['totalBalance']),5)
-    else:
-        balance_btc = 0
+    fail = True;
+    while fail:
+        nh_stats = get_nh_stats()
+        balance = requests.get(api_info.api_url_base + api_info.api_accounting_path, headers=construct_request(api_info.api_accounting_path))
+        if balance.status_code == 200:
+            balance = json.loads(balance.content.decode('utf-8'))
+            balance_btc = round(float(balance['totalBalance']),5)
+        else:
+            balance_btc = 0
+            
+        prices = requests.get(api_info.api_url_base + api_info.api_exchange_path, headers=construct_request(api_info.api_exchange_path))
+
+        if prices.status_code == 200:
+            prices_all = json.loads(prices.content.decode('utf-8'))
+            btc_price = prices_all['BTCUSDC']
+        else:
+            btc_price = 50000.00
+
+        balance_usd = float(balance_btc) * btc_price
+        profit_btc = nh_stats['totalProfitability']
+        profit_usd = profit_btc * btc_price;
+
+        next_pay = datetime.strptime(nh_stats['nextPayoutTimestamp'], '%Y-%m-%dT%H:%M:%SZ')
+        next_pay = next_pay.replace(tzinfo=from_zone)
+        next_pay_mt = next_pay.astimezone(to_zone)
+        time_now = datetime.now().astimezone(to_zone);
         
-    prices = requests.get(api_info.api_url_base + api_info.api_exchange_path, headers=construct_request(api_info.api_exchange_path))
-
-    if prices.status_code == 200:
-        prices_all = json.loads(prices.content.decode('utf-8'))
-        btc_price = prices_all['BTCUSDC']
-    else:
-        btc_price = 50000.00
-
-    balance_usd = float(balance_btc) * btc_price
-    profit_btc = nh_stats['totalProfitability']
-    profit_usd = profit_btc * btc_price;
-
-    next_pay = datetime.strptime(nh_stats['nextPayoutTimestamp'], '%Y-%m-%dT%H:%M:%SZ')
-    next_pay = next_pay.replace(tzinfo=from_zone)
-    next_pay_mt = next_pay.astimezone(to_zone)
-    time_now = datetime.now().astimezone(to_zone);
-    
-    time_to_pay = next_pay - time_now;
-    pay_hours, remainder = divmod(time_to_pay.seconds, 3600)
-    pay_minutes, seconds = divmod(remainder, 60)
-    next_pay_in = '{:2}h {:2}m'.format(int(pay_hours), int(pay_minutes))
-    rt_profit = "$" + str(round(profit_usd,2))
-    
-    if 'MINING' not in nh_stats['minerStatuses']:
-        logging.info("No Miner Data")
-        show_error('no data')
+        time_to_pay = next_pay - time_now;
+        pay_hours, remainder = divmod(time_to_pay.seconds, 3600)
+        pay_minutes, seconds = divmod(remainder, 60)
+        next_pay_in = '{:2}h {:2}m'.format(int(pay_hours), int(pay_minutes))
+        rt_profit = "$" + str(round(profit_usd,2))
+        
+        if 'MINING' not in nh_stats['minerStatuses']:
+            logging.info("No Miner Data")
+            show_error('no data')
+            logging.info("LN 126 - Sleep 30") 
+            time.sleep(30)
+        else:
+            fail = False
         
     num_mining = nh_stats['minerStatuses']['MINING']
     num_devices = nh_stats['devicesStatuses']['MINING']
@@ -180,10 +187,13 @@ def fetch_nh(sc):
         exit()
 
 def show_error(status):
-    logging.info("SHOW ERROR")
+    logging.info("SHOW ERROR - status: " + str(status))
     epd = epd2in13_V2.EPD()
     epd.init(epd.PART_UPDATE)
-    epd.Clear(0xFF)
+    font24 = ImageFont.truetype(os.path.join(picdir, 'Roboto-Regular.ttf'), 24)
+
+    image = Image.new('1', (epd.height, epd.width), 255)  # 255: clear the frame    
+    draw = ImageDraw.Draw(image)
     draw.rectangle([(0,84),(255,122)],fill = 0)
     draw.text((8, 90), str(status) + " Error from API", font = font24, fill = 1)
     image = image.transpose(Image.ROTATE_180)
