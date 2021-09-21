@@ -8,8 +8,8 @@ if os.path.exists(libdir):
     sys.path.append(libdir)
 
 import logging
-from waveshare_epd import epd2in13_V2
-from nicehash_creds import api_info
+from waveshare_epd import epd2in7
+from waveshare_epd import api_info
 import time
 from PIL import Image,ImageDraw,ImageFont
 import traceback
@@ -20,6 +20,13 @@ import sched
 from time import mktime, sleep
 from datetime import datetime
 from dateutil import tz
+import pytz
+import tzlocal
+import pprint
+
+# USD -> EUR
+from currency_converter import CurrencyConverter
+
 #import string
 import uuid
 import hmac
@@ -34,8 +41,12 @@ logging.basicConfig(filename=LOG_FILE,format=LOG_FORMAT,level=logging.DEBUG)
 
 #base variables    
 from_zone = tz.gettz('UTC')
-to_zone = tz.gettz('America/Denver')
+to_zone = tz.gettz('Europe/Berlin')
 query=''
+
+old_totalHashRate = 0
+
+pp = pprint.PrettyPrinter(indent=4)
 
 def get_epoch_ms_from_now():
     now = datetime.now()
@@ -74,51 +85,97 @@ def construct_request(endpoint):
                 'X-Request-Id': str(uuid.uuid4())}
     return headers
 
-def get_nh_stats():
-    fail = True;
-    while fail:
-        response = requests.get(api_info.api_url_base + api_info.api_rig_path, headers=construct_request(api_info.api_rig_path))
-        if response.status_code == 200:
-            fail = False
-            return json.loads(response.content.decode('utf-8'))
-        else:        
-            logging.info("Error response: " + str(response.status_code))
-            show_error(response.status_code)
-            time.sleep(30)
+
+def getUrl(url, params):
+        try:
+            response = requests.get(url, headers=params)
+        except requests.exceptions.RequestException as e:
+            print ("OOps: Connection Error",e)
+        else:
+            if response.status_code == 200:
+               return json.loads(response.content.decode('utf-8'))
+         
+        
+        return None
+        
+   
+
+def HashRate():
+    global old_totalHashRate
+    totalHashRate = 0
+    rigsHashRate = []
+    for rig in api_info.rigs_api:
+        rig_vals = getUrl(rig, construct_request(rig))
+        if not rig_vals:
+            continue
+
+        totalHashRate += rig_vals['total_hashrate_raw']
+        
+        rigsHashRate.append({
+           "totalHashRate"     : rig_vals['total_hashrate_raw'],
+           "totalPowerUsage"   : rig_vals['total_power_usage']
+        }) 
+
+    if old_totalHashRate > 0 and (old_totalHashRate - totalHashRate) > 10:
+        send_email('xpixer@gmail.com', 
+                   "Attention: Mining rig has less %d MH/s" % (old_totalHashRate - totalHashRate), 
+                   "Totalhasrate: %s : old_totalHashRate %s" % (totalHashRate, old_totalHashRate)
+        )
+    old_totalHashRate = totalHashRate
+
+
+    return {
+            "totalHashRate" : str(round(totalHashRate/1000000, 2)),
+            "rigsHashRate"  : rigsHashRate
+           }
     
 def return_nh_stats():
     fail = True;
+    c = CurrencyConverter()
     while fail:
-        nh_stats = get_nh_stats()
-        balance = requests.get(api_info.api_url_base + api_info.api_accounting_path, headers=construct_request(api_info.api_accounting_path))
-        if balance.status_code == 200:
-            balance = json.loads(balance.content.decode('utf-8'))
-            balance_btc = round(float(balance['totalBalance']),5)
-        else:
-            balance_btc = 0
-            
-        prices = requests.get(api_info.api_url_base + api_info.api_exchange_path, headers=construct_request(api_info.api_exchange_path))
+        # rate from dollar to euro
+        eur = c.convert(1, 'USD', 'EUR')
+ 
+        # get nicehash stats from there api
+        nh_stats = getUrl(api_info.api_url_base + api_info.api_rig_path, construct_request(api_info.api_rig_path))
+        if not nh_stats:
+            continue
 
-        if prices.status_code == 200:
-            prices_all = json.loads(prices.content.decode('utf-8'))
-            btc_price = prices_all['BTCUSDC']
-        else:
-            btc_price = 50000.00
+        # pp.pprint(nh_stats)
+
+        balance_btc = 0
+        balance = getUrl(api_info.api_url_base + api_info.api_accounting_path, construct_request(api_info.api_accounting_path))
+        if not balance:
+            continue
+        balance_btc = '{:f}'.format(float(balance['totalBalance']))
+
+        btc_price = 50000.00
+        prices_all = getUrl(api_info.api_url_base + api_info.api_exchange_path, construct_request(api_info.api_exchange_path))
+        if not prices_all:
+            continue
+        # pp.pprint(prices_all)
+        btc_price = prices_all['BTCUSDC']
+        
 
         balance_usd = float(balance_btc) * btc_price
-        profit_btc = nh_stats['totalProfitability']
+        profit_btc = nh_stats['totalProfitabilityLocal']
         profit_usd = profit_btc * btc_price;
 
         next_pay = datetime.strptime(nh_stats['nextPayoutTimestamp'], '%Y-%m-%dT%H:%M:%SZ')
         next_pay = next_pay.replace(tzinfo=from_zone)
         next_pay_mt = next_pay.astimezone(to_zone)
-        time_now = datetime.now().astimezone(to_zone);
-        
+        time_now = datetime.now(pytz.utc).astimezone(tzlocal.get_localzone())
+
         time_to_pay = next_pay - time_now;
         pay_hours, remainder = divmod(time_to_pay.seconds, 3600)
         pay_minutes, seconds = divmod(remainder, 60)
-        next_pay_in = '{:2}h {:2}m'.format(int(pay_hours), int(pay_minutes))
-        rt_profit = "$" + str(round(profit_usd,2))
+        next_pay_in = '{:02}:{:02}'.format(int(pay_hours), int(pay_minutes))
+        rt_profit = str(round(profit_usd * eur,2)) + u"\N{euro sign}"
+        
+        # get speedAccepted
+        speedAccepted = 0
+        for rig in nh_stats['miningRigs']:
+            speedAccepted += rig['stats'][0]['speedAccepted']
         
         if 'MINING' not in nh_stats['minerStatuses']:
             logging.info("No Miner Data")
@@ -132,77 +189,115 @@ def return_nh_stats():
     num_devices = nh_stats['devicesStatuses']['MINING']
     unpaid_btc = nh_stats['unpaidAmount']
     unpaid_usd = float(unpaid_btc) * float(btc_price)
-    stats_array = {"rtprofit": rt_profit + "/day",
+
+    hashrate = HashRate();
+
+    stats_array = {
+                   "rtprofit": rt_profit + "/day",
                    "btcprice": "${:,}".format(int(btc_price)) + "/BTC",
                    "activew": str(num_mining),
                    "actived": str(num_devices),
-                   "unpaid": "$" + str(round(unpaid_usd,2)),
+                   "unpaid": str(round(unpaid_usd * eur,2)) + u"\N{euro sign}",
                    "nextpay": next_pay_in,
                    "balancebtc": str(balance_btc) +" BTC",
-                   "balanceusd": "$" + str(round(balance_usd))}
+                   "balanceusd": str(round(balance_usd * eur,2)) + u"\N{euro sign}",
+                   "speedAccepted" : str(round(speedAccepted, 2)) + " MH/s",
+                   "totalHashRate" : hashrate['totalHashRate'] + "MH/s",
+                   "rigs"  : hashrate['rigsHashRate']
+                   } 
     return stats_array
     
 def fetch_nh(sc): 
     statsNow = return_nh_stats()
-    updatedTime = datetime.now().strftime("%l:%M:%P")
-    #uncomment below to see console output 
-    #print(statsNow["rtprofit"])
-    #print(statsNow["btcprice"])
-    #print("Active Workers: " + statsNow["activew"])
-    #print("Unpaid: " + statsNow["unpaid"])
-    #print("Payout in: "+ statsNow["nextpay"])
-    #print("Updated : " + updatedTime)
+    updatedTime = datetime.now().strftime("%H:%M")
     perpetual_check.enter(120, 1, fetch_nh, (sc,))
     try:
-        epd.init(epd.PART_UPDATE)
+        epd.init() #epd.PART_UPDATE)
         # set fonts
-        font15 = ImageFont.truetype(os.path.join(picdir, 'Roboto-Thin.ttf'), 15)
-        font17 = ImageFont.truetype(os.path.join(picdir, 'Roboto-Thin.ttf'), 17)
-        font24 = ImageFont.truetype(os.path.join(picdir, 'Roboto-Regular.ttf'), 24)
+        font15  = ImageFont.truetype(os.path.join(picdir, 'Roboto-Thin.ttf'), 15)
+        font15B = ImageFont.truetype(os.path.join(picdir, 'Roboto-Bold.ttf'), 15)
+
+        font17  = ImageFont.truetype(os.path.join(picdir, 'Roboto-Regular.ttf'), 17)
+        font17B = ImageFont.truetype(os.path.join(picdir, 'Roboto-Bold.ttf'), 17)
+
+        font24  = ImageFont.truetype(os.path.join(picdir, 'Roboto-Regular.ttf'), 24)
         font24B = ImageFont.truetype(os.path.join(picdir, 'Roboto-Bold.ttf'), 24)
 
         image = Image.new('1', (epd.height, epd.width), 255)  # 255: clear the frame    
         draw = ImageDraw.Draw(image)
         
         draw.rectangle([(0,0),(165,81)],fill = 0)
-        draw.rectangle([(0,84),(255,122)],fill = 0)
+        draw.rectangle([(0,84),(264,122)],fill = 0)
+        draw.rectangle([(0,125),(264,176)],fill = 1)
         draw.line([(164,0),(164,122)], fill = 0,width = 2)
+
         draw.text((8, 10), statsNow["rtprofit"], font = font24B, fill = 1)
-        draw.text((8, 43), statsNow["btcprice"], font = font24B, fill = 1)
-        draw.text((8, 90), statsNow["balancebtc"] + " / " + statsNow["balanceusd"], font = font24, fill = 1)
-        draw.text((172, 8), "@" + updatedTime, font = font15, fill = 0)
-        draw.text((172, 26), "actv: " + statsNow["activew"] + " / " + statsNow["actived"], font = font15, fill = 0)
-        draw.text((172, 44), "pnd: " + statsNow["unpaid"], font = font15, fill = 0)
-        draw.text((172, 62), "in" + statsNow["nextpay"], font = font15, fill = 0)
-        #draw.text((78, 93), "paying out in:" + statsNow["nextpay"], font = font17, fill = 1)
-        image = image.transpose(Image.ROTATE_180)
-        epd.displayPartial(epd.getbuffer(image))
+        draw.text((8, 43), statsNow["totalHashRate"], font = font24B, fill = 1)
+        #draw.text((8, 90), "Balance: " + statsNow["balanceusd"], font = font24B, fill = 1)
+        draw.text((8, 90), statsNow["balancebtc"] + " / " + statsNow["balanceusd"], font = font24B, fill = 1)
+
+        ypixel = 128
+        for rig in statsNow["rigs"]:
+            # pp.pprint(rig)
+            draw.text((8,   ypixel), str(round(rig["totalHashRate"]/1000000, 2)) + "MH/s", font = font17B, fill = 0)
+            draw.text((172, ypixel), str(rig["totalPowerUsage"]) + "W", font = font17B, fill = 0)
+            ypixel += 20
+            
+
+        draw.text((172, 4), updatedTime, font = font24B, fill = 0)
+        draw.text((172, 30), "activ: " + statsNow["activew"] + "/" + statsNow["actived"], font = font15B, fill = 0)
+        draw.text((172, 45), "upaid: " + statsNow["unpaid"], font = font15B, fill = 0)
+        draw.text((172, 60), "nxpay: " + statsNow["nextpay"], font = font15B, fill = 0)
+        epd.display(epd.getbuffer(image))
         
     except IOError as e:
         logging.info(e)
     
     except KeyboardInterrupt:    
         logging.info("ctrl + c:")
-        epd2in13_V2.epdconfig.module_exit()
+        epd2in7.epdconfig.module_exit()
         exit()
 
 def show_error(status):
     logging.info("SHOW ERROR - status: " + str(status))
-    epd = epd2in13_V2.EPD()
-    epd.init(epd.PART_UPDATE)
+    epd = epd2in7.EPD()
+    epd.init() #epd.PART_UPDATE)
     font24 = ImageFont.truetype(os.path.join(picdir, 'Roboto-Regular.ttf'), 24)
 
     image = Image.new('1', (epd.height, epd.width), 255)  # 255: clear the frame    
     draw = ImageDraw.Draw(image)
     draw.rectangle([(0,84),(255,122)],fill = 0)
     draw.text((8, 90), str(status) + " Error from API", font = font24, fill = 1)
-    image = image.transpose(Image.ROTATE_180)
-    epd.displayPartial(epd.getbuffer(image))
+    #image = image.transpose(Image.ROTATE_180)
+    epd.display(epd.getbuffer(image))
     return 
 
-epd = epd2in13_V2.EPD()
-epd.init(epd.FULL_UPDATE)
-epd.Clear(0xFF)
+def send_email(recipient, subject, body):
+    import smtplib
+
+    FROM = 'your@mining.rig'
+    TO = recipient if isinstance(recipient, list) else [recipient]
+    SUBJECT = subject
+    TEXT = body
+
+    # Prepare actual message
+    message = """From: %s\nTo: %s\nSubject: %s\n\n%s
+    """ % (FROM, ", ".join(TO), SUBJECT, TEXT)
+    try:
+        server = smtplib.SMTP("smtp.gmail.com", 587)
+        server.ehlo()
+        server.starttls()
+        server.login(os.environ.get('GMAILUSR'), os.environ.get('GMAILPWD'))
+        server.sendmail(FROM, TO, message)
+        server.close()
+        print 'successfully sent the mail'
+    except:
+        print "failed to send mail"
+
+
+epd = epd2in7.EPD()
+epd.init() #epd.FULL_UPDATE)
+#epd.Clear(0xFF)
 perpetual_check = sched.scheduler(time.time, time.sleep)
 perpetual_check.enter(0, 1, fetch_nh, (perpetual_check,))
 perpetual_check.run()
